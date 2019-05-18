@@ -1,0 +1,326 @@
+
+
+
+
+
+
+## YOLO - Part 1 - Understanding how the network works
+-------------------------------------------------------
+
+
+- FCN with 75 convolutional layers with skip connections and upsampling.
+	* Pooling not used to prevent loss of low-level features (instead convolution
+	 with stride two is used to downsample)
+
+- Being FCN, yolo invariante to size of input image. However in practice we might want 
+ to stick to a constant input size (else probs encountered during algo implementation).
+	* Big problem : processing images in batches requires all images to have same
+	 same h and w to concat multiple images to a large batch
+
+- If stride of network = 32, 416x416 image outputs 13x13
+
+- Output of Yolo is a feature map (13x13xdepth). 
+	* Each cell (neuron) can predict a fixed number of bounding boxes. 
+	* Depth = (B x (5 + C)) {B: no:of bounding boxes(bb), C: no:of classes)
+	* 5 represents tx, ty, tw, th and p0(objectness score)
+	* Each cell (neuron) predicts obj through one of bb if its center fall on the 
+	 receptive field of the cell.
+	* The cell containing center of ground truth box of obj is responsible to 
+	 predict object. (Anchor box then selected based on IOU score) 
+		+ | box 1 | box 2 | box 3 | --> box : {tx, ty, tw, th, p0, p1..pc}
+
+- Predicting h and w of boxes makes sense, but leads to unstable gradients during
+ training.
+	* Modern obj detectors predicts log-space transforms (or simply offsets to 
+	 predefined bb called anchors). 
+
+- Formulas below show how network's output transformed to obtain bb prediction:
+	* bx = sigma(tx) + cx
+	* by = sigma(ty) + cy
+	* bw = pw*exp(tw)
+	* bh = ph*exp(th)
+	* bx, by, bw, bh are x,y center co-ordinates, width and height of prediction.
+	* tx, ty, tw, th is what is output by the network
+	* cx and cy are top-left coords of the grid
+	* pw and ph are anchor dimension for the box
+
+- Center coords prediction tx and ty run through sigmoid, hence value b/w 0 and 1
+	* Yolo doesn't predict abs coords of bb's center, it predicts offsets:
+		+ Relative to top left corner of grid cell predicting the object. 
+		+ Normalized by dimensions of the cell from feature map, which is, 1
+		+ Example : if prediction for center is (0.4, 0.7) -> center lies at
+		 (6.4, 6.7) on the 13x13 feature map since corner coords (6,6) (dog pic)
+		+ and if tx,ty = (1.2,0.7), bx,by = (7.2,6.7), this would mean the 8th
+		 grid instead of 7th (as earlier), breaking yolo theory which says, the
+		 red box is responsible to detect dog. Hence sigmoid so values b/w 0 & 1
+
+- Dimensions of bb predicted by applying log-space transform onto output, and multiplying
+ with an anchor(pw*exp(tw)).
+	* The resulting predictions bw, bh are normalised by height and width of the
+	 image --> (0.3, 0.8) instead of (3.9, 10.4) as they were divide by 13. 
+		+ if bw and bh for box containing dog is (0.3,0.8) then actual h and w
+		 on 13x13 feature map is (13x0.3, 13x0.8)
+
+- Objectness score is prob obj contained in bb, box : {tx, ty, tw, th, p0, p1..pc}. 1 at
+ red grid and close to zero at other grids.
+	* Passed through sigmoid as values b/w 0 and 1 required.
+
+- Class confidence is prob that detected obj belongs to a class.
+	* Here sigmoid function used instead of softmax cause softmaxing class scores 
+	 assume classes are mutually exclusive, i.e if obj belongs to one class, they 
+	 can't belong to another
+		+ this is false in classes like 'Women' and 'Person'
+
+- In Yolo v3 prediction occurs across 3 different scales.
+	* Detection layer used to make detection on feature maps of 3 different size, 
+	 having strides 32, 16, 8.
+		+ i.e with input of 416x416 output feature maps are 13x13, 26x26, 52x52
+	* Network downsamples images till first detection layer, here detection is made
+	 on feature maps with stride 32.
+	* Further, layers are upsampled by factor of 2, concat with feature maps of prev
+	 layers having identical feature map.
+	* Another detection is effectuated at layer with stride 16 & another at stride 8
+
+	* For an image of size 416 x 416, YOLO predicts ((52 x 52) + (26 x 26) + 
+	 (13 x 13)) x 3 = 10647 bounding boxes
+
+- Non-max suppression is used to screen out multiple detections of the same object by 
+ different grid cells by first taking the box with highest confidence score and then
+ deleting other boxes/detections whose IOU scores with the selected box is larger than
+ a threshold.
+
+
+
+
+
+## YOLO - Part 2 - Creating layers of the network
+--------------------------------------------------
+
+- There are 5 types of layers that are used in Yolo
+	
+	* Convolutional {batch_norm:1/0, filters:64, size:3, stride:1, pad=1,
+	 acti:leaky}
+	
+	* Shortcut {from:-3, acti:linear}
+		+ Skip connection similar to one used in Resnet, from = -3 means the 
+		 output of shortcut layer obtained by adding feature maps from previous
+		 and 3rd layer backward from shortcut layer
+	
+	* Upsample {stride:2} : Upsamples feature map from prev layer by a factor of 
+	 stride using bilinear upsampling
+	
+	* Route {layers:-4 or layers: -3, 61}
+		+ One-val : output feature map of 4th layer backwards from route layer
+		+ Two-vals : output feature map of (3rd layer backwards from the route 		 layer added to the output feature map from the layer before the route
+		 layer) concatenated with the (output feature map of the 61st layer
+		 added to the output feature map from the layer before the route
+		 layer)  
+
+	* Yolo {mask:0,1,2, anchors:(10,13,  16,30,  33,23,  30,61,  62,45,  59,119, 
+	 116,90,  156,198,  373,326), classes:80, num:9, jitter=0.3, ignore_thresh:1, 
+	 truth_thresh:1, random:1}
+		+ This layer corresponds to the detection layer, which is used to make
+		 detection at feature maps of three different sizes, having strides 32,
+		 16 and 8.
+		+ There are 9 anchors, but only ones indexed in 'mask' are used 
+		 (0,1,2). Makes sense as each cell in detection layer predicts 3 boxes.
+
+- The 'net' block describes info about the network input and train parameters. 
+
+- The function 'create modules' returns nn.ModuleList, which is a class like a normal 
+ python list containing nn.Module objects.
+	* The class nn.ModuleList holds submodules in a list.
+	* When modules are added to module_list (module_list = nn.ModuleList()) all its
+	 parameters are recorded 
+
+- The nn.Sequential class is used to sequentially execute a number of nn.Module objects
+	* The cfg files have blocks(5 diff types of layers) which contain may contain
+	 more than one layer {conv2d -> relu -> batchnorm} nn.Sequential strings them
+	 together
+
+- For designing a layer for the Route block, an nn.Module object has to be build and
+ Initialized with with values of the attribute layers as its members.
+
+- The reason for EmptyLayer at the place of a route layer is to avoid increase in
+ boiler plate code. As this layer entails a simple concatenation with feature map of 
+ previous layer and a layer from the previous steps.
+	* The same can be said for the shortcut layer where it merely adds feature maps
+	 of a previous layer to the layer x backward from the shortcut layer. Hence can 	 be taken care off in the forward call. 
+
+- As for the Yolo layer, a detection layer gets put into nn.Sequential class. The layer
+ Holds the anchors to detect bounding boxes
+
+
+
+
+
+## YOLO - Part 3 - Implementing the forward pass of the network
+---------------------------------------------------------------
+
+
+- The forward pass serves two purposes:
+	* Calculate the output
+	* Transform the output detection feat maps so they can be processed easier
+		+ The output detections across the 3 yolo layers are different
+
+- The forward pass iterates over the created 'blocks'
+	* We find what type of block it is {convolutions/route/Upsample/yolo/shortcut}
+	* We summon the corresponding module from module_list using index i
+	* We pass the input through the module 
+	* Repeat
+
+- Since route and shortcut layer need output maps from previous layers, the feature map
+ outputs of every layer is cached in the dictionary 'output' 
+
+- x = torch.cat((map1, map2), 1) --> for the route layer the concatenation is along the
+ second axis as images come in batches of the format : (batch, channel, height, width)
+
+- The detection/yolo layer outputs a convolutional feature map that contains bounding box
+ Attributes along the depth of the map.
+	* The bb attributes predicted by cells on the grid are stacked one over another.
+	 To access second bb of cell (5,6) is map [5,6, (5+C): 2*(5+C)]
+		+ This form is inconvenient for thresholding by obj confidence, adding 
+		 grid offsets to centers, applying anchors etc
+		+ Another problem is since detections happened thrice, the dimensions of 
+		 prediction maps are different each time. And since the output processing
+		 operations on the 3 outputs are the same its would be nice to have to do
+		 these operations on a single tensor rather than three separate tensors.
+	* 'predict_transform' resolves all these probs.
+	* if write = 0, the output from 'predict_tranform' is stored in the variable 
+	 detection and write  = 1. In the following loops the predictions are simply 
+	 concatenated to detections. 
+
+- 'predict_transform' takes 5 args : prediction, inp_dim, anchors, num_class and CUDA.
+	* It takes a detection feat map and turns it into a 2-D tensor where each row
+	 corresponds to the building blocs across the grids. And cols the box features.
+		(Assuming 19x19 feat map)tx. ty. tw. th. p0. p_0. p_1. ... pn. 
+			1st BB @ (0,0)
+			2nd BB @ (0,0)
+			3rd BB @ (0,0)
+			.      .     .
+			.      .     .
+			3rd BB @ (19,19)
+	* The dim in anchors are in the form (height, width) and describes the dim of 
+	 input images - which is larger by a factor of stride. Hence we divide it by 
+	 stride. --> [(a[0]/stride, a[1]/stride) for a in anchors]
+	* Constructing the bb coordinates from predicted offsets (tx, ty) entails
+		+ Calculating sigmoid of offsets (including obj score for later use)
+		+ Then the cx and cy values are calculated using meshgrid.
+		+ cx and cy are then added to the calculated offsets (eg: sigmoid(tx)+cx
+	* Constructing the bb height and width from predicted offsets (tw, th) entails:
+		+ creating a 2-D tensor with repeating anchor height(ph) and width(pw)
+		 values.
+		+ Multiplying these values with exponential of offset values th and tw.
+	* Sigmoid function is then applied to class scores.
+	* Finally resize detections bx,by,bw,bh by multiplying with stride of network.
+
+- NEED TO UNDERSTAND WORKING OF WEIGHT LOAD FUNCTION
+
+
+
+
+## YOLO - Part 4 - Confidence Thresholding and Non-maximum supression
+---------------------------------------------------------------------
+
+- The output from the forward pass must be subjected to objectless score thresholding and 
+ Non-max suppression to obtain 'True Detections'.
+	* Of the total prediction say, prediction(batches, 10624, 85) using a threshold
+	 we set the entire row representing bb to zero if below the threshold. 
+	* Then, if an objects is detected by multiple grids, the bb with highest obj
+	 score is kept deleting the remaining bb with IOU's greater than a defined
+	 threshold.
+
+- The bb attributes are described by the center, height and width, but to calculate IOU
+ of two boxes it'd be easier to calculate using coordinate pairs of diagonal corners of
+ each box.
+
+- In a for loop then:
+	* Indices of classes with max prob and the prob is stored in variables
+		+ The variables are then turned into a 2-D tensor (x, 1)
+	* The max indice and value tensors are then concatenated to to the box attribute
+	 values to form a tensor of shape (10624, 5+2) instead of (10624, 5+80)
+	* Then remove objects or detections with obj score < threshold. 
+	* Find the number of unique classes left and begin another loop:
+		+ Get all detections of say class '1' 
+		+ Sort instances in decreasing value of obj score
+		+ Call the IoU function(pred[I],pred[I:]) returning a list of IoU's of
+		  pred[I] with the rest.
+		+ remove all instances with IoU's greater than threshold.
+		+ Repeat
+
+
+## YOLO - Part 5 - The Input Output Pipelines 
+---------------------------------------------
+
+- The command line arguments are setup first.
+	* This is followed by loading of class names.
+	* Then the network is initialized and the weights are loaded onto it.
+
+- The input images are then read and their paths are stored in a list
+	* Using the list, the images are read 'cv2.imread' and stored in another list.
+	* List of loaded images are passed through prep_img function 
+		+ The function first pads the image instead of resizing it
+		+ Then the image rep is changed to CHW from HWC where C: BGR -> RGB
+	* repeat(1,2) : NOT SURE WHAT THIS SERVES TO
+ 	* Finally image batches are created.
+	
+
+- For the detection loop, batches are iterated over to generate predictions
+	* The prediction tensors are of the shape (D*8) {Dectections, (1+5+2)}
+		+ 1 : signifies which elements in the batch is being output. Usually, 
+		 batches of images are fed into the network and '1' helps differentiate
+		 as to in which position in the batch is the image.
+		+ 5 : tx, ty, tw, th, p0
+		+ 2 : Class confidence and class number
+		+ Later '1' is change from index in batch to index in whole dataset
+	* classes[int(x[-1])] for x in output if int(x[0]) == im_id] : output the class
+	 name
+	* If the 'write_results' function for batch is int(0) there is no detection and
+	 we continue 
+	
+	* AT THE END OF THIS STEP WE HAVE THE DETECTIONS OF ALL IMAGES IN OUR TENSOR
+
+- 	
+## YOLO - PART 6 - Train On Own Dataset
+---------------------------------------
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
